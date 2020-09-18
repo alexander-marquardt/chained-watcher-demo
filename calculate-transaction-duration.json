@@ -1,0 +1,201 @@
+{
+  "trigger": {
+    "schedule": {
+      "interval": "10m"
+    }
+  },
+  "input": {
+    "chain": {
+      "inputs": [
+        {
+          "get_ended_events": {
+            "search": {
+              "request": {
+                "search_type": "query_then_fetch",
+                "indices": [
+                  "transaction_original"
+                ],
+                "rest_total_hits_as_int": true,
+                "body": {
+                  "size": 100,
+                  "query": {
+                    "bool": {
+                      "filter": [
+                        {
+                          "range": {
+                            "@timestamp": {
+                              "gte": "now-60d"
+                            }
+                          }
+                        },
+                        {
+                          "bool": {
+                            "must": [
+                              {
+                                "match": {
+                                  "tags": "end_event"
+                                }
+                              },
+                              {
+                                "exists": {
+                                  "field": "ident"
+                                }
+                              }
+                            ],
+                            "must_not": [
+                              {
+                                "exists": {
+                                  "field": "elapsed_time_in_seconds"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "get_idents_of_ended_events": {
+            "transform": {
+              "script": {
+                "source": """
+                  def matchingIdentsArr = [];
+                  for (def hit : ctx.payload.get_ended_events.hits.hits) {
+                    matchingIdentsArr.add(hit._source.ident);
+                  }
+                  ctx.payload.matchingIdentsArr = matchingIdentsArr;
+
+                """,
+                "lang": "painless"
+              }
+            }
+          }
+        },
+        {
+          "get_corresponding_start_events": {
+            "search": {
+              "request": {
+                "search_type": "query_then_fetch",
+                "indices": [
+                  "transaction_original"
+                ],
+                "rest_total_hits_as_int": true,
+                "body": {
+                  "size": 100,
+                  "query": {
+                    "bool": {
+                      "filter": [
+                        {
+                          "bool": {
+                            "must": [
+                              {
+                                "match": {
+                                  "tags": "start_event"
+                                }
+                              },
+                              {
+                                "terms": {
+                                  "ident": [
+                                    "{{#join delimiter='",
+                                    "'}}ctx.payload.matchingIdentsArr{{/join delimiter='",
+                                    "'}}"
+                                  ]
+                                }
+                              }
+                            ],
+                            "must_not": [
+                              {
+                                "exists": {
+                                  "field": "elapsed_time_in_seconds"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "create_hashmap_of_corresponding_start_events": {
+            "transform": {
+              "script": {
+                "source": """
+                  def startEventsHash = new HashMap();
+                  for (def hit : ctx.payload.get_corresponding_start_events.hits.hits) {
+                    startEventsHash[hit._source.ident] = hit._source;
+                  }
+                  ctx.payload.startEventsHash = startEventsHash;
+
+                """,
+                "lang": "painless"
+              }
+            }
+          }
+        },
+        {
+          "calculate_and_store_transaction_durtion": {
+            "transform": {
+              "script": {
+                "source": """
+                  def docsToUpdate = [];
+                  for (def hit : ctx.payload.get_ended_events.hits.hits) {
+                    def end_time = hit._source['@timestamp'];
+                    def event_ident = hit._source['ident'];
+                    if (ctx.payload.startEventsHash.containsKey(event_ident)) {
+                        def newDoc = new HashMap();
+
+                        def start_event = ctx.payload.startEventsHash[event_ident];
+                        def start_time = start_event['@timestamp'];
+                        def event_duration_in_seconds = ChronoUnit.MILLIS.between(ZonedDateTime.parse(start_time), ZonedDateTime.parse(end_time))/1000;
+                        newDoc['event_duration_in_seconds'] = event_duration_in_seconds;
+                        newDoc['_id'] = hit._id;
+                        for (x in hit._source.entrySet()) {
+                          newDoc[x.getKey()] = x.getValue();
+                        }
+
+                        docsToUpdate.add(newDoc)
+                    }
+                  }
+                  ctx.payload.docsToUpdate = docsToUpdate;
+                """,
+
+                "lang": "painless"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "condition": {
+    "always": {}
+  },
+  "actions": {
+    "overwrite_ended_events": {
+      "transform": {
+        "script": """
+            return [ "_doc" : ctx.payload.docsToUpdate]; 
+        """
+        },
+        "index": {
+            "index": "transaction_original"
+        } 
+    },
+    "my-logging-action": {
+      "logging": {
+        "level": "info",
+        "text": " ***  {{ctx.payload.docsToUpdate}}  *** "
+      }
+    }
+  }
+}
